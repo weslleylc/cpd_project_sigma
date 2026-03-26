@@ -69,19 +69,6 @@ def cupy_to_torch(c):
 # SUPPORT FUNCTIONS
 # =============================================================================
 
-def matvec_full_sigma(x_cp, A_core, dim_size, rank):
-    """
-    Generalized Matrix-Vector multiplication for Sigma-Aware systems.
-    This applies the 'A' matrix logic for any mode.
-    """
-    x_torch = cupy_to_torch(x_cp).view(dim_size, rank).to(torch.float32)
-
-    # A_core is the (Dim x Rank x Dim x Rank) interaction tensor
-    # We contract the input vector across the last two dimensions
-    res = torch.einsum('iajb,jb->ia', A_core, x_torch)
-
-    return torch_to_cupy(res.flatten())
-
 def reconstruct_tensor_from_factors(factors):
     """
     Reconstructs the CP model.
@@ -120,95 +107,113 @@ def matvec_M_cp(x_cp, Z_sigma_Z, out_c, rank):
 # MAIN ALGORITHM
 # =============================================================================
 
-def cp_als_full_sigma(tensorT, rank, sigma_half, n_iter_max=100, tol=1e-6):
+def cp_als_sigma(tensorT, rank, sigma_half, n_iter_max=100, tol=1e-6, verbose=1):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. FORMATTING [In, H, W, Out]
+    # 1. PREPARATION (Move Output axis to the end for Sigma alignment)
     if len(tensorT.shape) == 3:
         out_c, in_c, hw = tensorT.shape
         h = w = int(math.sqrt(hw))
+        # [Out, In, H, W] -> [In, H, W, Out]
         tensor = torch.moveaxis(tensorT.view(out_c, in_c, h, w), 0, -1).to(device)
     else:
         tensor = torch.moveaxis(tensorT, 0, -1).to(device)
 
-    in_c, h, w, out_c = tensor.shape
+    tsize = tensor.size()
+    in_c, h, w, out_c = tsize
+
+    # Convert Sigma_half (Σ^{1/2}) to full Sigma (Σ) for the ALS update
     sigma_half = sigma_half.to(device)
     sigma = torch.matmul(sigma_half, sigma_half.t())
-    sigma_6d = sigma.view(in_c, h, w, in_c, h, w)
+
+    # Calculate normalization factor for relative error
+    norm_sigma_tensor = torch.norm(torch.matmul(sigma, tensor.reshape((-1, out_c))))
 
     # 2. INITIALIZATION
-    factors = [torch.randn([in_c, rank], device=device),  # Mode 0: S
-               torch.randn([h, rank], device=device),  # Mode 1: H
-               torch.randn([w, rank], device=device),  # Mode 2: W
-               torch.randn([out_c, rank], device=device)]  # Mode 3: T
+    # Shape: [Dimension, Rank]
+    factors = [torch.randn([in_c, rank], device=device),  # U_S
+               torch.randn([h, rank], device=device),  # U_H
+               torch.randn([w, rank], device=device),  # U_W
+               torch.randn([out_c, rank], device=device)]  # U_T
 
-    for f in factors: f /= (torch.norm(f, dim=0) + 1e-9)
+    # Initial unit normalization
+    for f in factors:
+        f /= (torch.norm(f, dim=0, keepdim=True) + 1e-9)
 
-    norm_sig_tensor = torch.norm(torch.matmul(sigma, tensor.reshape((-1, out_c))))
-    errors = []
+    rec_errors = [
+        calcul_err_sigma(tensor, sigma, reconstruct_tensor_from_factors(factors)) / norm_sigma_tensor]
 
-    # 3. THE FULL SIGMA LOOP
+    # 3. ALS LOOP
     for iteration in range(n_iter_max):
+        # Update sequence: Mode 3 (Target/Output), then S, H, W
         for mode in [3, 0, 1, 2]:
-            U_S, U_H, U_W, U_T = factors
 
-            if mode == 3:  # Update Output Channels (T)
-                # b = Vec( K * Sigma * (S_kr_H_kr_W) )
-                K_sig = torch.matmul(sigma, tensor.reshape((-1, out_c))).view(in_c, h, w, out_c)
-                b_target = torch.einsum('shwt,sr,hr,wr->tr', K_sig, U_S, U_H, U_W)
+            if mode == 3:
+                # --- SIGMA-AWARE UPDATE (U_T) ---
+                U_S, U_H, U_W = factors[0], factors[1], factors[2]
 
-                # A_core = (S_kr_H_kr_W).T * Sigma * (S_kr_H_kr_W) -> Result: [Rank, Rank]
-                # Because T is outside Sigma, A is diagonal in blocks (Identity_T @ A_core)
-                A_core_small = torch.einsum('sr,hr,wr,shwabc,aq,bq,cq->rq', U_S, U_H, U_W, sigma_6d, U_S,
-                                            U_H, U_W)
+                # b = Vec(K * Sigma * M)
+                # First: Apply importance weighting to the Kernel (K * Sigma)
+                K_sigma_tensor = torch.matmul(sigma, tensor.reshape((-1, out_c))).view(in_c, h, w, out_c)
 
-                # Optimization: For Mode T, A is simpler because T is independent
-                def matvec_T(v_cp):
-                    v_torch = cupy_to_torch(v_cp).view(out_c, rank)
-                    return torch_to_cupy(torch.matmul(v_torch, A_core_small).flatten())
+                # Second: Project weighted kernel onto the fixed factors (M.T)
+                # Math: b_target = einsum(Target, Projection_S, Projection_H, Projection_W)
+                b_target = torch.einsum('shwt,sr,hr,wr->tr', K_sigma_tensor, U_S, U_H, U_W)
+                b_cp = torch_to_cupy(b_target.flatten())
 
-                A_op = LinearOperator((out_c * rank, out_c * rank), matvec=matvec_T, dtype=cp.float32)
+                # A = M.T * Sigma * M (Size: Rank x Rank)
+                sigma_6d = sigma.view(in_c, h, w, in_c, h, w)
+                # This performs the projection of the 6D Sigma tensor onto the rank space
+                Z_sigma_Z = torch.einsum('sr,hr,wr,shwabc,aq,bq,cq->rq',
+                                         U_S, U_H, U_W, sigma_6d, U_S, U_H, U_W)
 
-            elif mode == 0:  # Update Input Channels (S)
-                # This is the "Full Sigma" part. We contract everything except S.
-                # b_target_S: [S, Rank]
-                b_target = torch.einsum('shwt,shwabc,tr,hr,wr->sr', tensor, sigma_6d, U_T, U_H, U_W)
-
-                # A_core_S: [S, Rank, S_prime, Rank_prime]
-                A_core = torch.einsum('tr,tq,hr,wr,shwabc,hq,wq->s r a q', U_T, U_T, U_H, U_W, sigma_6d,
-                                      U_H, U_W)
-                A_op = LinearOperator((in_c * rank, in_c * rank),
-                                      matvec=lambda v: matvec_full_sigma(v, A_core, in_c, rank),
+                # Solve Ax = b using Matrix-Free MINRES
+                n_params = out_c * rank
+                A_op = LinearOperator((n_params, n_params),
+                                      matvec=lambda v: matvec_M_cp(v, Z_sigma_Z, out_c, rank),
                                       dtype=cp.float32)
 
-            elif mode == 1:  # Update Height (H)
-                b_target = torch.einsum('shwt,shwabc,tr,sr,wr->hr', tensor, sigma_6d, U_T, U_S, U_W)
-                A_core = torch.einsum('tr,tq,sr,wr,shwabc,sq,wq->h r b q', U_T, U_T, U_S, U_W, sigma_6d,
-                                      U_S, U_W)
-                A_op = LinearOperator((h * rank, h * rank),
-                                      matvec=lambda v: matvec_full_sigma(v, A_core, h, rank),
-                                      dtype=cp.float32)
+                u_flat_cp, _ = minres(A_op, b_cp, tol=1e-10, maxiter=500)
+                factors[3] = cupy_to_torch(u_flat_cp).view(out_c, rank).to(torch.float32)
 
-            elif mode == 2:  # Update Width (W)
-                b_target = torch.einsum('shwt,shwabc,tr,sr,hr->wr', tensor, sigma_6d, U_T, U_S, U_H)
-                A_core = torch.einsum('tr,tq,sr,hr,shwabc,sq,hq->w r c q', U_T, U_T, U_S, U_H, sigma_6d,
-                                      U_S, U_H)
-                A_op = LinearOperator((w * rank, w * rank),
-                                      matvec=lambda v: matvec_full_sigma(v, A_core, w, rank),
-                                      dtype=cp.float32)
+            else:
+                # --- STANDARD ALS UPDATE (Modes S, H, W) ---
+                # These modes follow standard Frobenius CP-ALS logic
+                others = [f for i, f in enumerate(factors) if i != mode]
 
-            # SOLVE
-            b_cp = torch_to_cupy(b_target.flatten())
-            u_flat_cp, _ = minres(A_op, b_cp, tol=1e-9, maxiter=500)
-            factors[mode] = cupy_to_torch(u_flat_cp).view(factors[mode].shape).to(torch.float32)
+                # Compute Khatri-Rao Product Z
+                Z = others[0]
+                for f in others[1:]:
+                    Z = (Z.unsqueeze(1) * f.unsqueeze(0)).reshape(-1, rank)
 
-        # Balancing & Convergence
-        rec = reconstruct_tensor_from_factors(factors)
-        err = calcul_err_sigma(tensor, sigma, rec, out_c) / norm_sig_tensor
-        errors.append(err.item())
-        print(f"Iter {iteration + 1} | Full Sigma Error: {err:.6f}")
-        if iteration > 0 and abs(errors[-2] - errors[-1]) < tol: break
+                # Solve normal equation with Tikhonov regularization
+                M_reg = torch.t(Z) @ Z + 1e-6 * torch.eye(rank, device=device)
+                W_m = tensor.permute(mode, *[i for i in range(4) if i != mode]).reshape(tsize[mode], -1)
+                factors[mode] = torch.t(torch.linalg.solve(M_reg, torch.t(Z) @ torch.t(W_m)))
 
+        # 4. SCALE BALANCING (Geometric Mean normalization)
+        norms = [torch.norm(f, dim=0) for f in factors]
+        gm_alpha = torch.pow(torch.prod(torch.stack(norms), dim=0), 1.0 / 4.0)
+        for n in range(4):
+            factors[n] *= (gm_alpha / (norms[n] + 1e-9))
+
+        # 5. CONVERGENCE CHECKING
+        current_rec = reconstruct_tensor_from_factors(factors)
+        err_sig = calcul_err_sigma(tensor, sigma, current_rec) / norm_sigma_tensor
+        err_frob = calcul_err(tensor, current_rec)
+        rel_frob = err_frob / torch.norm(tensor)
+
+        rec_errors.append(err_sig.item())
+
+        if verbose:
+            print(
+                f"Iter {iteration + 1} | Sigma Err: {err_sig:.6f} | Rel Frob Err: {rel_frob:.6f} | Delta: {rec_errors[-2] - rec_errors[-1]:.4e}")
+
+        if iteration > 0 and (rec_errors[-2] - rec_errors[-1]) < tol:
+            if verbose: print("Convergence reached.")
+            break
+
+    # Revert to original PyTorch format [Out, In, H, W]
     return [factors[3], factors[0], factors[1], factors[2]]
 
 
