@@ -97,7 +97,6 @@ def calcul_err(tensor, tensor2):
 def matvec_M_cp(x_cp, Z_sigma_Z, out_c, rank):
     """Matrix-vector operator for the linear system A * u = b."""
     x_torch = cupy_to_torch(x_cp).view(out_c, rank).to(torch.float32)
-    # The A matrix for Mode-T is effectively: Id(T) \otimes (M.T * Sigma * M)
     # Calculated as: U_T * Z_sigma_Z
     res = torch.matmul(x_torch, Z_sigma_Z)
     return torch_to_cupy(res.flatten())
@@ -152,25 +151,39 @@ def cp_als_sigma(tensorT, rank, sigma_half, n_iter_max=100, tol=1e-6, verbose=1)
                 # --- SIGMA-AWARE UPDATE (U_T) ---
                 U_S, U_H, U_W = factors[0], factors[1], factors[2]
 
-                # b = Vec(K * Sigma * M)
-                # First: Apply importance weighting to the Kernel (K * Sigma)
-                K_sigma_tensor = torch.matmul(sigma, tensor.reshape((-1, out_c))).view(in_c, h, w, out_c)
+                # --- SIGMA-AWARE UPDATE (U_T) ---
+                # Math: b = Vec( K * Sigma * M )
 
-                # Second: Project weighted kernel onto the fixed factors (M.T)
-                # Math: b_target = einsum(Target, Projection_S, Projection_H, Projection_W)
-                b_target = torch.einsum('shwt,sr,hr,wr->tr', K_sigma_tensor, U_S, U_H, U_W)
+                # 1. Flatten the PyTorch tensor to match mathematical K
+                # Shape: [T, S*H*W]. We use reshape() to handle non-contiguous memory safely.
+                K = tensor.reshape(out_c, -1)
+
+                # 2. Apply Sigma exactly as the formula says: K * Sigma
+                # Shape: [T, S*H*W] @ [S*H*W, S*H*W] -> [T, S*H*W]
+                K_sigma = torch.matmul(K, sigma)
+
+                # 3. Reshape back to 4D so we can project the factors
+                # Shape: [T, S, H, W]
+                K_sigma_tensor = K_sigma.reshape(out_c, in_c, h, w)
+
+                # 4. Multiply by M (Projection onto the rank space)
+                # Math: einsum(Target_K_Sigma, U_S, U_H, U_W)
+                # Shape: [T, R], T=out_c
+                b_target = torch.einsum('tshw,sr,hr,wr->tr', K_sigma_tensor, U_S, U_H, U_W)
+
+                # 5. Vectorize (Vec)
                 b_cp = torch_to_cupy(b_target.flatten())
 
                 # A = M.T * Sigma * M (Size: Rank x Rank)
                 sigma_6d = sigma.view(in_c, h, w, in_c, h, w)
                 # This performs the projection of the 6D Sigma tensor onto the rank space
-                Z_sigma_Z = torch.einsum('sr,hr,wr,shwabc,aq,bq,cq->rq',
+                MT_sigma_M = torch.einsum('sr,hr,wr,shwabc,aq,bq,cq->rq',
                                          U_S, U_H, U_W, sigma_6d, U_S, U_H, U_W)
 
                 # Solve Ax = b using Matrix-Free MINRES
                 n_params = out_c * rank
                 A_op = LinearOperator((n_params, n_params),
-                                      matvec=lambda v: matvec_M_cp(v, Z_sigma_Z, out_c, rank),
+                                      matvec=lambda v: matvec_M_cp(v, MT_sigma_M, out_c, rank),
                                       dtype=cp.float32)
 
                 u_flat_cp, _ = minres(A_op, b_cp, tol=1e-10, maxiter=500)
