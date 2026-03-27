@@ -10,7 +10,7 @@ from cupyx.scipy.sparse.linalg import minres, LinearOperator
 from pathlib import Path
 
 # =============================================================================
-# MATHEMATICAL DERIVATION FOR YOUR PROFESSOR (Equation 30)
+# MATHEMATICAL DERIVATION (Equation 30)
 # =============================================================================
 """
 Goal: Minimize || Vec(K * Sigma^1/2) - P_T * Vec(U_T) ||^2
